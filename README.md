@@ -16,7 +16,7 @@ This repository combines targeted llama.cpp optimizations, a measured quality/pe
 | Speculative decoding | [Inco Qwen3.8-27B-DFlash2 GGUF](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2-GGUF), **Q8_0**, **three proposals** |
 | Vision | GPU encoder; **64 minimum / 4,096 maximum visual tokens per image** |
 | Parallelism | Tensor parallel across both GPUs; **one active sequence**, with requests queued |
-| Batching | Target microbatch **1024**, logical batch **2048**, draft microbatch **128** |
+| Batching | Target microbatch **1024**, logical batch **2048**, draft microbatch **64** |
 | Session reuse | Automatic persistent prefix cache, enabled by default |
 
 All target decoder layers remain on GPU. The vision encoder and draft backbone occupy opposite TP ranks; the drafter shares the target's existing TP-sharded output head. The approximately 1.26-GiB input embedding table stays in CPU RAM. **No CPU vision offload or private draft-head conversion is required.**
@@ -180,7 +180,7 @@ Keep host overrides together in the ignored [`config.env`](config.example.env), 
 | `HOST` / `PORT` | `127.0.0.1` / `3847` |
 | `MODEL_ROOT` | Sibling `../models`; individual `TARGET_MODEL`, `VISION_MODEL`, `DRAFT_MODEL` paths can override it |
 | `CPU_THREADS` | `16` |
-| `UBATCH` / `BATCH` / `DRAFT_UBATCH` | `1024` / `2048` / `128` |
+| `UBATCH` / `BATCH` / `DRAFT_UBATCH` | `1024` / `2048` / `64` |
 | `DRAFT_TOKENS` | `3` |
 | `IMAGE_MIN_TOKENS` / `IMAGE_MAX_TOKENS` | `64` / `4096` |
 | `REASONING` | `off`; can be enabled per API request |
