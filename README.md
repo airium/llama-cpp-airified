@@ -25,22 +25,18 @@ The image minimum is a preprocessing floor, not a fixed allocation. A 256×256 i
 
 ## Performance
 
-Each populated cell is **cold prefill / decode, in tokens/s**. `32K = 32,768` and `128K = 131,072` input tokens. The current route uses **1024 unrestricted natural output tokens**, greedy sampling, normal EOS, and zero prefix reuse. Prefill is input tokens divided by client TTFT; decode excludes the first streamed token batch.
+Speed cells are **cold prefill / decode, in tokens/s**: medians of two fresh-process runs, with **32,768 or 131,072 input tokens and 1,024 unrestricted natural output tokens**. Sampling is greedy with normal EOS and no prefix reuse. Prefill is input tokens divided by client TTFT; decode excludes the first streamed token batch.
 
-| Route | 32K code | 128K code | 32K prose | 128K prose |
-| --- | ---: | ---: | ---: | ---: |
-| Unmodified llama.cpp engine, Q8/Q8 KV/256K, DFlash2-3† | 965.1 / 66.4 | — | 968.7 / 49.4 | — |
-| **This repo: Q8/Q8 KV/256K, Q8 DFlash2-3** | **1130.9 / 73.4** | **784.2 / 63.1** | **1124.9 / 55.3** | **784.8 / 49.9** |
-| vLLM: FP8/FP8 KV/**220K**, **MTP3**‡ | — | — | — | — |
-| vLLM: FP8/TQK8V4/256K, MTP4† | 1375.9 / 49.0 | — | 1376.7 / 40.2 | — |
-| vLLM: NVFP4/FP8 KV/256K, DFlash2-7† | 1195.1 / 116.8 | — | 1196.9 / 64.8 | — |
+| Route | Peak VRAM (GiB) | 4.2 MP image | 32K code | 128K code | 32K prose | 128K prose |
+| --- | ---: | :---: | ---: | ---: | ---: | ---: |
+| Unmodified llama.cpp, Q8/Q8 KV/256K, MTP3 | 42.0 | OOM | 941.7 / 65.3 | 633.4 / 44.2 | 939.1 / 49.9 | 631.8 / 35.3 |
+| Unmodified llama.cpp, Q8/Q8 KV/256K, Q4 DFlash2-3 | 41.4 | PASS | 944.0 / 71.0 | 652.5 / 49.1 | 942.8 / 51.3 | 650.9 / 38.4 |
+| **This repo: Q8/Q8 KV/256K, Q8 DFlash2-3** | **41.3** | PASS | **1148.1 / 73.3** | **793.9 / 63.2** | **1144.9 / 55.4** | **793.2 / 49.8** |
+| vLLM: FP8/FP8 KV/220K, MTP3 | 41.6 | PASS | 1361.3 / 62.2 | 915.6 / 58.9 | 1368.7 / 49.9 | 915.1 / 48.1 |
+| vLLM: FP8/TQK8V4/256K, MTP4 | 42.2 | PASS | 1393.1 / 55.8 | 974.8 / 25.0 | 1389.1 / 42.7 | 973.5 / 19.3 |
+| vLLM: NVFP4/FP8 KV/256K, DFlash2-7 | 41.5 | PASS | 1212.3 / 121.1 | 861.8 / 112.9 | 1204.2 / 70.1 | 857.8 / 60.9 |
 
-**Comparison scope:** these are measured deployment routes, not a precision-, configuration-, or hardware-matched framework ablation.
-
-- **Current row:** one complete validation matrix for the cache-enabled build. Prose runs on one GPU pair and code on another; the pairs have different clock characteristics. A separate parameter campaign tested 48 settings, completed 46, and repeated the selected setting 11 times.
-- **† Historical references:** medians of two fresh-process **32K/512-output** natural-generation tests on the same reference pair. The stock-engine row uses an older **Q4 draft with a private head**, not the current shared-head Q8 route. Different output budgets, drafts and batch settings prevent treating these rows as isolated optimization speedups. No forced-token/synthetic scores are used here.
-- **‡ Capacity reference only:** the validated FP8/FP8-KV profile uses **225,280 tokens and MTP3**, not full 256K/MTP4. No matching natural-output matrix was recorded. **— means unmeasured**, not zero or unsupported.
-- vLLM references use the [SM75-tuned vLLM 2080 Ti Definitive deployment](https://github.com/weicj/vLLM-2080Ti-Definitive), with its local patches, rather than stock vLLM. NVFP4 is a different, mixed-precision target route; its speed is not an eight-bit quality-equivalent result.
+All routes use identical prompts and fixed GPU pairs per workload. These are deployment comparisons: draft precision, speculation and route settings differ. The stock MTP row uses the target's embedded prediction block; the stock DFlash2 row uses a Q4 drafter with a private head. This repository uses the original Q8 drafter with a shared head. vLLM results use the [local SM75-tuned deployment](https://github.com/airium/vLLM-2080Ti-Definitive), based on [weicj's vLLM 2080 Ti Definitive Edition](https://github.com/weicj/vLLM-2080Ti-Definitive), not stock vLLM. Its FP8/FP8-KV route has 225,280-token context; NVFP4 trades target precision for speed.
 
 ### Restart and conversation-switch latency
 
@@ -48,10 +44,10 @@ With a matching persisted prefix, a fresh process avoids almost all long-context
 
 | Input | Prose TTFT: cold → SSD restore | Code TTFT: cold → SSD restore |
 | --- | ---: | ---: |
-| 32K | 29.13 s → **2.83 s** | 28.97 s → **2.87 s** |
-| 128K | 167.01 s → **7.20 s** | 167.14 s → **6.96 s** |
+| 32K | 28.75 s → **2.80 s** | 28.36 s → **2.86 s** |
+| 128K | 165.47 s → **7.26 s** | 165.41 s → **6.93 s** |
 
-These tests start a fresh process per SSD case, advise only the test cache's clean file pages out of the OS cache, and verify physical storage reads. The 128K cases reuse **131,068 tokens**, process **four**, and produce identical output-token sequences to their cold/GPU-hot references. Subsequent decode remains about **50 tok/s prose / 64 tok/s code**. Server startup is separate from TTFT; first use also fingerprints the model files.
+Each SSD case starts a fresh process and verifies physical storage reads after advising the test cache's clean file pages out of the OS cache. The 128K cases reuse **131,068 tokens**, process **four**, and generate the same 1,024 output-token IDs as their cold/GPU-hot references. Server startup is separate from TTFT; first use also fingerprints the model files.
 
 ## Tested environment
 
@@ -196,7 +192,7 @@ DRAFT_UBATCH=256
 DRAFT_TOKENS=6
 ```
 
-In the repeated tuning comparison, code decode rises from **73.1 → 81.5 tok/s at 32K** and **63.0 → 64.3 tok/s at 128K**: roughly **11% / 2%**, not a universal 10% gain. Prefill is slower, and the control-adjusted two-length prose decode aggregate is about 17% worse. This alternative passed full-context/image qualification during tuning; it is not the default. Simply increasing proposal length is not guaranteed to improve speed.
+During tuning, this alternative reached about **81.5 tok/s at 32K** and **64.3 tok/s at 128K** for code decode, at the cost of slower prose decoding and prefill. It passed full-context/image qualification but is not the default. Simply increasing proposal length is not guaranteed to improve speed.
 
 ## Automatic tiered prefix cache
 
@@ -217,7 +213,7 @@ Use a dedicated cache directory; independent server processes need separate root
 
 Only committed snapshots survive a restart. Edited prefixes or incompatible builds can require prefill again; hybrid GDN reuse needs a valid recurrent boundary. `cache_prompt:false` bypasses persistent lookup and saving for that request.
 
-Disk writes are incremental, but capture still reads/hashes live state at a safe engine boundary. The measured post-generation capture barrier is about **4.3 s at 128K**; capture is not fully nonblocking. This Linux implementation does not support persistent caching with LoRA adapters.
+Disk writes are incremental, but capture still reads/hashes live state at a safe engine boundary. Capture is not fully nonblocking; its pause grows with the saved context size. This Linux implementation does not support persistent caching with LoRA adapters.
 
 `GET /slots` exposes `persistent_cache` hit/miss, disk, hot/queued-buffer and deduplication counters. Response `timings.cache_n` and `timings.prompt_n` show actual reused and recomputed tokens.
 
@@ -235,11 +231,11 @@ Images use standard `image_url` content parts. Enable reasoning per request with
 
 ## Validation
 
-The selected Q8 route has passed:
+The Q8 deployment has passed:
 
 - **Exact full context with vision:** 261632 input tokens, including a 4096-token image, plus 512 generated tokens = **262144**; correct image facts, accepted DFlash proposals and no OOM.
 - **Fresh-process full-context restore:** 261628 reused / four new input tokens, all 512 output tokens, identical generated text and correct image facts.
-- **Natural 32K/1K and 128K/1K prose/code:** identical output-token sequences across cold, GPU-hot, fresh-process warm-file and verified SSD-backed runs.
+- **Natural 32K/1K and 128K/1K prose/code:** identical output-token sequences across cold, GPU-hot and verified SSD-backed fresh-process runs.
 - Arithmetic, JSON/instruction following, code, enabled reasoning, tool calls and tool-result continuation.
 - 64-token small images, 4096-token images, five maximum-budget images, and rejection of stale reuse for changed images.
 - Shared-prefix branching, RAM-tier switching, disk quotas/eviction, corrupt-entry fallback, interrupted-write recovery and read-only access-metadata handling.
