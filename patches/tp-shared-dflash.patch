@@ -1,0 +1,101 @@
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 9ee64b5..bcf9a32 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -417,24 +417,53 @@ llama_context::llama_context(
+     }
+ 
+     if (!hparams.vocab_only) {
+-        // GPU backends
+-        for (const auto & dev : model.devices) {
+-            ggml_backend_t backend = ggml_backend_dev_init(dev.dev, nullptr);
++        auto init_backend = [&](ggml_backend_dev_t dev) {
++            for (const auto & backend : backends) {
++                if (ggml_backend_get_device(backend.get()) == dev) {
++                    return;
++                }
++            }
++            ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
+             if (backend == nullptr) {
+-                throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev.dev)));
++                throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev)));
+             }
+             backends.emplace_back(backend);
++        };
++
++        // Borrowed weights must keep their owning backend, including a TP head.
++        for (const auto & dev : model.devices) {
++            init_backend(dev.dev);
++        }
++        if (cparams.ctx_other) {
++            for (const auto & dev : llama_get_model(cparams.ctx_other)->devices) {
++                init_backend(dev.dev);
++            }
++        }
++        auto init_tensor_backend = [&](const ggml_tensor * tensor) {
++            if (tensor && tensor->buffer) {
++                auto dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(tensor->buffer));
++                if (dev && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
++                    init_backend(dev);
++                }
++            }
++        };
++        init_tensor_backend(model.tok_embd);
++        init_tensor_backend(model.output);
++        if (cparams.ctx_other) {
++            const auto * other = llama_get_model(cparams.ctx_other);
++            if (!model.tok_embd) {
++                init_tensor_backend(other->tok_embd);
++            }
++            if (!model.output) {
++                init_tensor_backend(other->output);
++            }
+         }
+ 
+         // add ACCEL backends (such as BLAS)
+         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+             ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+             if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
+-                ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
+-                if (backend == nullptr) {
+-                    throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev)));
+-                }
+-                backends.emplace_back(backend);
++                init_backend(dev);
+             }
+         }
+ 
+@@ -2851,6 +2880,16 @@ llm_graph_cb llama_context::graph_get_cb() const {
+             ggml_set_name(cur, name);
+         }
+ 
++        if (strcmp(name, "dflash_logits_gather") == 0) {
++            for (const auto & backend : backends) {
++                if (ggml_backend_get_device(backend.get()) == model.dev_layer(0) &&
++                        ggml_backend_supports_op(backend.get(), cur)) {
++                    ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend.get());
++                    break;
++                }
++            }
++        }
++
+         // - norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends
+         // - force the last op of the layer on the specified backend to avoid running it on the backend of the next layer due to scheduling
+         // FIXME: fix in ggml_backend_sched
+diff --git a/src/models/dflash.cpp b/src/models/dflash.cpp
+index 6f28d2f..3517b69 100644
+--- a/src/models/dflash.cpp
++++ b/src/models/dflash.cpp
+@@ -1099,6 +1099,12 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
+     }
+ 
+     if (model.dflash_selector_hidden) {
++        const auto output_dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(output->buffer));
++        if (ggml_backend_dev_type(output_dev) == GGML_BACKEND_DEVICE_TYPE_META) {
++            // Candidate selection needs complete vocabulary rows, not TP slices.
++            res->t_logits = ggml_dup(ctx0, res->t_logits);
++            cb(res->t_logits, "dflash_logits_gather", -1);
++        }
+         build_dflash2_selector(*this, model, inp_tokens);
+     } else if (model.lilicorr_pass_hidden_proj && ubatch.embd_state && n_tokens == (int64_t) hparams.dflash_block_size * ubatch.n_seqs_unq) {
+         build_lilicorr_scores(*this, model, tok_embd, inp_anchor);

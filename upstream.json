@@ -1,0 +1,15 @@
+{
+  "url": "https://github.com/ggml-org/llama.cpp.git",
+  "revision": "5aeac37a35b44fde4bdffaec9159f2fcb253b622",
+  "commit_date": "2026-10-18T10:59:06+02:00",
+  "patches": [
+    "patches/sm75-q8-attention.patch",
+    "patches/tp-shared-dflash.patch",
+    "patches/tp-workspace-and-peer-copy.patch",
+    "patches/speculative-context-end.patch",
+    "patches/tp-lazy-collectives.patch",
+    "patches/dflash-mode-reserve.patch",
+    "patches/persistent-prefix-cache.patch"
+  ],
+  "status": "Pinned local SM75/TP fork: six qualified performance patches plus automatic bounded persistent prefix caching with streamed native state, shared immutable chunks, hybrid/draft/media checkpoints, strong identity, quota eviction and corruption recovery. See runtime archive for qualification."
+}

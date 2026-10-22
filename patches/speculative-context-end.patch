@@ -1,0 +1,36 @@
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index a18b754..e29ce05 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -1973,7 +1973,7 @@ private:
+         return true;
+     }
+ 
+-    bool process_token(completion_token_output & result, server_slot & slot) {
++    bool process_token(completion_token_output & result, server_slot & slot, size_t n_pending_tokens = 0) {
+         // remember which tokens were sampled - used for repetition penalties during sampling
+         const std::string token_str = result.text_to_send;
+         slot.sampled = result.tok;
+@@ -2023,8 +2023,11 @@ private:
+             slot.has_next_token = true;
+         }
+ 
+-        // if context shifting is disabled, make sure that we don't run out of context
+-        if (!params_base.ctx_shift && slot.prompt.n_tokens() + 1 >= slot.n_ctx) {
++        // Accepted speculative tokens can be cached before they are emitted.
++        const size_t n_prompt_cached = slot.prompt.n_tokens();
++        GGML_ASSERT(n_pending_tokens <= n_prompt_cached);
++        const size_t n_prompt_emitted = n_prompt_cached - n_pending_tokens;
++        if (!params_base.ctx_shift && n_prompt_emitted + 1 >= (size_t) slot.n_ctx) {
+             slot.truncated      = true;
+             slot.stop           = STOP_TYPE_LIMIT;
+             slot.has_next_token = false;
+@@ -4633,7 +4636,7 @@ private:
+ 
+                 slot.stats.n_gen += 1;
+ 
+-                if (!process_token(result, slot)) {
++                if (!process_token(result, slot, ids.size() - i - 1)) {
+                     slot.print_timings();
+                     send_final_response(slot);
+                     slot.release();

@@ -1,0 +1,82 @@
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -16,6 +16,7 @@
+ 
+ #include <cinttypes>
+ #include <cmath>
++#include <cstdlib>
+ #include <cstring>
+ #include <limits>
+ #include <stdexcept>
+@@ -164,6 +165,12 @@
+     /*.name             =*/ "fused DeepSeek V4 HC post",
+     /*.n_tokens_per_seq =*/ 1,
+ };
++
++static bool llama_dflash_mode_reserve(const llama_model & model) {
++    const char * enabled = std::getenv("LLAMA_DFLASH_MODE_RESERVE");
++    return enabled && std::atoi(enabled) == 1 && model.arch == LLM_ARCH_DFLASH &&
++        model.dflash_selector_hidden && model.fc && model.hparams.dflash_block_size > 0 && !model.hparams.no_alloc;
++}
+ 
+ llama_context::llama_context(
+         const llama_model & model,
+@@ -837,6 +844,15 @@
+         n_nodes_tg         = ggml_graph_n_nodes(gf);
+         n_inputs_tg        = get_gf_res_reserve()->inputs.size();
+         n_input_tensors_tg = this->n_input_tensors;
++    }
++
++    if (llama_dflash_mode_reserve(model)) {
++        auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs, mctx.get(), false, nullptr, true);
++        if (!gf) {
++            throw std::runtime_error("failed to reserve DFlash feature injection graph");
++        }
++        LLAMA_LOG_INFO("%s: DFlash reservation only: generation <= %u positions per sequence, feature injection = %u tokens; microbatch unchanged\n",
++            __func__, model.hparams.dflash_block_size, n_tokens);
+     }
+ 
+     // reserve again with pp graph to avoid ggml-alloc reallocations during inference
+@@ -2648,7 +2664,11 @@
+ }
+ 
+ ggml_cgraph * llama_context::graph_reserve(
+-        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes) {
++        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes, bool embd_input) {
++    if (llama_dflash_mode_reserve(model) && !embd_input) {
++        n_tokens = (uint32_t) std::min<uint64_t>(n_tokens, (uint64_t) model.hparams.dflash_block_size * n_seqs);
++        n_outputs = std::min(n_outputs, n_tokens);
++    }
+     LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs);
+     GGML_ASSERT(n_outputs >= 1);
+ 
+@@ -2675,6 +2695,18 @@
+ 
+     llama_batch_allocr balloc(model.hparams.n_pos_per_embd());
+     llama_ubatch ubatch = balloc.ubatch_reserve(n_tokens/n_seqs, n_seqs);
++
++    std::vector<float> embd_placeholder;
++    if (embd_input) {
++        GGML_ASSERT(llama_dflash_mode_reserve(model));
++        const int64_t width = model.fc->ne[0];
++        if (width <= 0 || (uint64_t) n_tokens > SIZE_MAX / sizeof(float) / (uint64_t) width) {
++            throw std::runtime_error("invalid DFlash feature reserve shape");
++        }
++        embd_placeholder.resize((size_t) width * n_tokens);
++        ubatch.token = nullptr;
++        ubatch.embd = embd_placeholder.data();
++    }
+ 
+     ubatch_prepare_reserve(ubatch, n_outputs, sampling.samplers, cparams.n_outputs_max_per_seq);
+ 
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -258,7 +258,7 @@
+ 
+     // reserve a graph with a dummy ubatch of the specified size
+     ggml_cgraph * graph_reserve(
+-        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr);
++        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr, bool embd_input = false);
+ 
+     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
+ 

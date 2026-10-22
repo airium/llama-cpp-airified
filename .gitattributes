@@ -1,0 +1,2 @@
+# Patch context markers are significant, including a space on blank lines.
+patches/*.patch -whitespace

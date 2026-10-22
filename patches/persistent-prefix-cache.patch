@@ -1,0 +1,1680 @@
+diff --git a/common/arg.cpp b/common/arg.cpp
+index 8b302d5..cb918a9 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -3645,6 +3645,26 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+             }
+         }
+     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SLOT_SAVE_PATH"));
++    add_opt(common_arg(
++        {"--cache-dir"}, "PATH",
++        "directory for automatic persistent prefix caching (default: disabled)",
++        [](common_params & params, const std::string & value) { params.cache_dir_path = value; }
++    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CACHE_DIR"));
++    add_opt(common_arg(
++        {"--cache-dir-max"}, "N",
++        "persistent cache upper watermark in MiB",
++        [](common_params & params, int value) { if (value <= 0) throw std::invalid_argument("cache-dir-max must be positive"); params.cache_dir_max_mib = value; }
++    ).set_examples({LLAMA_EXAMPLE_SERVER}));
++    add_opt(common_arg(
++        {"--cache-dir-target"}, "N",
++        "persistent cache eviction target in MiB",
++        [](common_params & params, int value) { if (value < 0) throw std::invalid_argument("cache-dir-target must be non-negative"); params.cache_dir_target_mib = value; }
++    ).set_examples({LLAMA_EXAMPLE_SERVER}));
++    add_opt(common_arg(
++        {"--cache-dir-min-free"}, "N",
++        "minimum filesystem free space in MiB",
++        [](common_params & params, int value) { if (value < 0) throw std::invalid_argument("cache-dir-min-free must be non-negative"); params.cache_dir_min_free_mib = value; }
++    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+     add_opt(common_arg(
+         {"--media-path"}, "PATH",
+         "directory for loading local media files; files can be accessed via file:// URLs using relative paths (default: disabled)",
+diff --git a/common/common.h b/common/common.h
+index 0c2d5e4..1fc5641 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -641,6 +641,10 @@ struct common_params {
+     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
+     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
+     bool    cache_ram_explicit  = false; // set by --cache-ram, decision models disable the cache otherwise
++    std::string cache_dir_path;
++    int32_t cache_dir_max_mib = 163840;
++    int32_t cache_dir_target_mib = 131072;
++    int32_t cache_dir_min_free_mib = 16384;
+ 
+     std::string public_path   = "";                                                                         // NOLINT
+     std::string api_prefix    = "";                                                                         // NOLINT
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index c593ec0..4240e7d 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -4788,3 +4788,25 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
+ llama_context * llama_get_ctx_other(struct llama_context * ctx) {
+     return ctx->get_cparams().ctx_other;
+ }
++
++size_t llama_state_seq_write_io(llama_context * ctx, llama_seq_id seq_id, llama_io_write_i & io) {
++    try {
++        ctx->synchronize();
++        return ctx->state_seq_write_data(io, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE);
++    } catch (const std::exception & e) {
++        LLAMA_LOG_ERROR("%s: %s\n", __func__, e.what());
++        return 0;
++    }
++}
++
++size_t llama_state_seq_read_io(llama_context * ctx, llama_seq_id seq_id, llama_io_read_i & io) {
++    try {
++        ctx->synchronize();
++        return ctx->state_seq_read_data(io, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE);
++    } catch (const std::exception & e) {
++        io.discard();
++        llama_memory_seq_rm(llama_get_memory(ctx), seq_id, -1, -1);
++        LLAMA_LOG_ERROR("%s: %s\n", __func__, e.what());
++        return 0;
++    }
++}
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 5b9dd9a..630d2f8 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -162,6 +162,9 @@ struct llama_context {
+ 
+     size_t state_seq_get_size(llama_seq_id seq_id, llama_state_seq_flags flags);
+ 
++    friend size_t llama_state_seq_write_io(llama_context *, llama_seq_id, llama_io_write_i &);
++    friend size_t llama_state_seq_read_io (llama_context *, llama_seq_id, llama_io_read_i  &);
++
+     size_t state_seq_get_data(llama_seq_id seq_id,       uint8_t * dst, size_t size, llama_state_seq_flags flags);
+     size_t state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags);
+ 
+diff --git a/src/llama-ext.h b/src/llama-ext.h
+index 8b3932b..00ae618 100644
+--- a/src/llama-ext.h
++++ b/src/llama-ext.h
+@@ -10,6 +10,13 @@
+ #include <map>
+ #include <vector>
+ 
++class llama_io_write_i;
++class llama_io_read_i;
++
++// The caller must hold exclusive access to the sequence while streaming its state.
++LLAMA_API size_t llama_state_seq_write_io(llama_context * ctx, llama_seq_id seq_id, llama_io_write_i & io);
++LLAMA_API size_t llama_state_seq_read_io (llama_context * ctx, llama_seq_id seq_id, llama_io_read_i  & io);
++
+ // Reserve a new compute graph. It is valid until the next call to llama_graph_reserve.
+ LLAMA_API struct ggml_cgraph * llama_graph_reserve(
+         struct llama_context * ctx,
+diff --git a/src/llama-impl.cpp b/src/llama-impl.cpp
+index c216a31..4951971 100644
+--- a/src/llama-impl.cpp
++++ b/src/llama-impl.cpp
+@@ -90,12 +90,15 @@ void llama_log_callback_default(ggml_log_level level, const char * text, void *
+ }
+ 
+ void llama_clear_tensor_data(ggml_tensor * t, size_t offset, size_t size) {
+-    static const std::vector<uint8_t> zeros(1024*1024, 0);
++    // TP tensors require complete logical rows for host transfers.
++    const size_t row = t->nb[1];
++    GGML_ASSERT(row > 0);
++    const size_t step = std::max(row, (size_t(1024*1024)/row)*row);
++    const std::vector<uint8_t> zeros(std::min(size, step), 0);
+ 
+     // not all backend buffers implement ggml_backend_tensor_memset(), so write zeros instead
+-    // TODO: make this a generic fallback in `ggml_backend_tensor_memset` when `set_tensor` is available
+-    for (size_t ofs = 0; ofs < size; ofs += zeros.size()) {
+-        ggml_backend_tensor_set(t, zeros.data(), offset + ofs, std::min(size - ofs, zeros.size()));
++    for (size_t ofs = 0; ofs < size; ofs += step) {
++        ggml_backend_tensor_set(t, zeros.data(), offset + ofs, std::min(size - ofs, step));
+     }
+ }
+ 
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 991bf54..7208922 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -193,6 +193,9 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+     llama_build_and_test(test-server-component.cpp)
+     target_include_directories(test-server-component PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+     target_link_libraries(test-server-component PRIVATE server-context)
++    llama_build_and_test(test-server-persist.cpp)
++    target_include_directories(test-server-persist PRIVATE ${PROJECT_SOURCE_DIR}/tools/server ${PROJECT_SOURCE_DIR}/vendor)
++    target_link_libraries(test-server-persist PRIVATE server-context vendor::hash)
+     llama_build_and_test(test-json-schema-to-grammar.cpp)
+ 
+     if (NOT GGML_BACKEND_DL)
+diff --git a/tests/test-server-persist.cpp b/tests/test-server-persist.cpp
+new file mode 100644
+index 0000000..33048ae
+--- /dev/null
++++ b/tests/test-server-persist.cpp
+@@ -0,0 +1,166 @@
++#include "hash/hash.h"
++#include "server-persist.h"
++#include "testing.h"
++
++#include <unistd.h>
++
++#include <filesystem>
++#include <fstream>
++
++namespace fs = std::filesystem;
++
++struct fixture {
++    fs::path               root;
++    server_persist_options options;
++
++    fixture() {
++        char   pattern[] = "/tmp/llama-persist-test-XXXXXX";
++        char * directory = mkdtemp(pattern);
++        if (!directory) {
++            throw std::runtime_error("mkdtemp failed");
++        }
++        root                   = directory;
++        options.directory      = root.string();
++        options.identity       = std::string(64, 'a');
++        options.ram_bytes      = 64u << 20;
++        options.max_bytes      = 2u << 20;
++        options.target_bytes   = 1u << 20;
++        options.min_free_bytes = 0;
++        {
++            server_persistent_cache cache(options);
++        }
++    }
++
++    ~fixture() { fs::remove_all(root); }
++
++    static void write(const fs::path & path, const std::string & value) {
++        std::ofstream file(path, std::ios::binary);
++        file << value;
++        if (!file) {
++            throw std::runtime_error("test file write failed");
++        }
++    }
++
++    std::string blob(char value, size_t bytes) {
++        std::string data(bytes, value);
++        auto        hash = hash_sha256_hex(data.data(), data.size());
++        write(root / "objects" / (hash + ".bin"), data);
++        return hash;
++    }
++
++    fs::path entry(char id, const std::string & hash, size_t bytes, int hits, int access) {
++        json empty = {
++            { "bytes",  0             },
++            { "chunks", json::array() }
++        };
++        json stream = {
++            { "bytes",  bytes                                         },
++            { "chunks", json::array({ json::array({ hash, bytes }) }) }
++        };
++        json value = {
++            { "version",     1                                     },
++            { "identity",    options.identity                      },
++            { "n_tokens",    64                                    },
++            { "prefixes",    json::array({ std::string(64, 'b') }) },
++            { "checkpoints", json::array()                         },
++            { "target",      stream                                },
++            { "draft",       empty                                 },
++            { "tokens",      empty                                 },
++            { "spec",        empty                                 },
++            { "hits",        hits                                  },
++            { "access",      access                                }
++        };
++        auto canonical    = value.dump();
++        value["checksum"] = hash_sha256_hex(canonical.data(), canonical.size());
++        auto path         = root / "entries" / (std::string(64, id) + ".json");
++        write(path, value.dump());
++        return path;
++    }
++};
++
++int main(int argc, char ** argv) {
++    testing t;
++    if (argc > 1) {
++        t.set_filter(argv[1]);
++    }
++    t.test("exclusive root lease", [](testing & t) {
++        fixture                 f;
++        server_persistent_cache first(f.options);
++        bool                    rejected = false;
++        try {
++            server_persistent_cache second(f.options);
++        } catch (const std::exception &) {
++            rejected = true;
++        }
++        t.assert_true("second writer rejected", rejected);
++        t.assert_equal("first writer alive", size_t(0), first.stats()["entries"].get<size_t>());
++    });
++    t.test("crash leftovers and invalid manifests", [](testing & t) {
++        fixture f;
++        auto    hash = f.blob('x', 4096);
++        fixture::write(f.root / "objects" / "pending.bin.tmp", "partial");
++        fixture::write(f.root / "entries" / "pending.json.tmp", "partial");
++        auto path = f.entry('c', hash, 4096, 0, 1);
++        fixture::write(path, "{\"checksum\":\"wrong\"}");
++        server_persistent_cache cache(f.options);
++        t.assert_equal("invalid entry removed", size_t(0), cache.stats()["entries"].get<size_t>());
++        t.assert_true("no orphan objects", fs::is_empty(f.root / "objects"));
++        t.assert_true("no partial manifests", fs::is_empty(f.root / "entries"));
++    });
++    t.test("byte quota protects reused entries", [](testing & t) {
++        fixture f;
++        auto    shared         = f.blob('s', 700000);
++        auto    cold           = f.blob('c', 700000);
++        auto    keep           = f.entry('a', shared, 700000, 1, 1);
++        auto    alias          = f.entry('b', shared, 700000, 0, 2);
++        auto    evict          = f.entry('c', cold, 700000, 0, 3);
++        f.options.max_bytes    = 1100000;
++        f.options.target_bytes = 800000;
++        server_persistent_cache cache(f.options);
++        t.assert_true("reused entry retained", fs::exists(keep));
++        t.assert_true("probation entries evicted", !fs::exists(alias) && !fs::exists(evict));
++        t.assert_true("shared object retained", fs::exists(f.root / "objects" / (shared + ".bin")));
++        t.assert_true("unused object deleted", !fs::exists(f.root / "objects" / (cold + ".bin")));
++        t.assert_true("quota met", cache.stats()["disk_bytes"].get<size_t>() <= f.options.max_bytes);
++    });
++    t.test("missing objects invalidate a snapshot", [](testing & t) {
++        fixture                 f;
++        auto                    path = f.entry('d', std::string(64, 'e'), 4000, 0, 1);
++        server_persistent_cache cache(f.options);
++        t.assert_true("manifest removed", !fs::exists(path));
++        t.assert_equal("safe empty cache", size_t(0), cache.stats()["entries"].get<size_t>());
++    });
++    t.test("unrelated directory is preserved", [](testing & t) {
++        fixture f;
++        fs::remove(f.root / ".llama-persist-format");
++        fixture::write(f.root / "important.txt", "keep");
++        bool rejected = false;
++        try {
++            server_persistent_cache cache(f.options);
++        } catch (const std::exception &) {
++            rejected = true;
++        }
++        t.assert_true("refuses unrelated data", rejected);
++        t.assert_true("file retained", fs::exists(f.root / "important.txt"));
++    });
++    t.test("strong model identity and memo invalidation", [](testing & t) {
++        fixture f;
++        auto    model = f.root / "test-model.gguf";
++        fixture::write(model, "model-A");
++        common_params params;
++        params.cache_dir_path = f.root.string();
++        params.model.path     = model.string();
++        const auto first      = server_persistent_cache::identity(params);
++        t.assert_true("unchanged identity is stable", first == server_persistent_cache::identity(params));
++        const auto time = fs::last_write_time(model);
++        fixture::write(model, "model-B");
++        fs::last_write_time(model, time);
++        const auto changed = server_persistent_cache::identity(params);
++        t.assert_true("same-size same-mtime edit invalidates memo", first != changed);
++        const auto moved = f.root / "renamed-model.gguf";
++        fs::rename(model, moved);
++        params.model.path = moved.string();
++        t.assert_true("content identity survives a path change", changed == server_persistent_cache::identity(params));
++    });
++    return t.summary();
++}
+diff --git a/tools/server/CMakeLists.txt b/tools/server/CMakeLists.txt
+index 70b8d7d..1a3a01b 100644
+--- a/tools/server/CMakeLists.txt
++++ b/tools/server/CMakeLists.txt
+@@ -9,6 +9,8 @@ add_library(${TARGET} STATIC
+     server-chat.h
+     server-task.cpp
+     server-task.h
++    server-persist.cpp
++    server-persist.h
+     server-queue.cpp
+     server-queue.h
+     server-common.cpp
+@@ -32,8 +34,15 @@ if (BUILD_SHARED_LIBS)
+ endif()
+ 
+ target_include_directories(${TARGET} PRIVATE ../mtmd)
+-target_include_directories(${TARGET} PRIVATE ${PROJECT_SOURCE_DIR})
+-target_link_libraries(${TARGET} PUBLIC llama-common mtmd ${CMAKE_THREAD_LIBS_INIT})
++target_include_directories(${TARGET} PRIVATE ${PROJECT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/src)
++target_link_libraries(${TARGET} PUBLIC llama-common mtmd vendor::hash ${CMAKE_THREAD_LIBS_INIT})
++if (LLAMA_OPENSSL)
++    find_package(OpenSSL QUIET)
++endif()
++if (TARGET OpenSSL::Crypto)
++    target_link_libraries(${TARGET} PRIVATE OpenSSL::Crypto)
++    target_compile_definitions(${TARGET} PRIVATE LLAMA_PERSIST_OPENSSL)
++endif()
+ 
+ # llama-server-impl: server logic, reusable by app
+ 
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index e29ce05..92f0adc 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -4,6 +4,7 @@
+ #include "server-decision.h"
+ #include "server-http.h"
+ #include "server-task.h"
++#include "server-persist.h"
+ #include "server-queue.h"
+ #include "server-schema.h"
+ #include "server-stream.h"
+@@ -1023,6 +1024,7 @@ private:
+     int n_empty_consecutive = 0;
+ 
+     std::unique_ptr<server_prompt_cache> prompt_cache;
++    std::unique_ptr<server_persistent_cache> persistent_cache;
+ 
+     server_metrics metrics;
+ 
+@@ -1046,6 +1048,7 @@ private:
+     int64_t t_last_load_progress_ms = 0;
+ 
+     void destroy() {
++        persistent_cache.reset();
+         spec.reset();
+         spec_init.reset();
+ 
+@@ -1449,6 +1452,11 @@ private:
+                 // flush the generated token stats before reset()
+                 if (slot.stats.n_gen > 0) {
+                     metrics_on_prediction(slot);
++                    if (persistent_cache && slot.task->params.cache_prompt && !slot.task->is_stateless() && !slot.task->is_child()) {
++                        std::vector<uint8_t> state;
++                        common_speculative_get_state(spec.get(), slot.id, state);
++                        persistent_cache->save(slot.prompt, ctx_tgt, ctx_dft, slot.id, state);
++                    }
+                 }
+             };
+ 
+@@ -1497,7 +1505,26 @@ private:
+             params_base.cache_idle_slots = false;
+         }
+ 
+-        if (params_base.cache_ram_mib != 0) {
++        if (!params_base.cache_dir_path.empty()) {
++            try {
++                server_persist_options options;
++                options.directory = params_base.cache_dir_path;
++                options.identity = server_persistent_cache::identity(params_base);
++                options.cache_hot = params_base.cache_ram_mib != 0;
++                options.ram_bytes = size_t(params_base.cache_ram_mib < 0 ? 512 : std::max(64, params_base.cache_ram_mib)) << 20;
++                if (!params_base.lora_adapters.empty()) {
++                    throw std::runtime_error("persistent cache does not support LoRA adapters");
++                }
++                options.max_bytes = uint64_t(params_base.cache_dir_max_mib) << 20;
++                options.target_bytes = uint64_t(params_base.cache_dir_target_mib) << 20;
++                options.min_free_bytes = uint64_t(params_base.cache_dir_min_free_mib) << 20;
++                persistent_cache = std::make_unique<server_persistent_cache>(options);
++                params_base.cache_idle_slots = false;
++            } catch (const std::exception & e) {
++                SRV_ERR("persistent cache initialization failed: %s\n", e.what());
++                return false;
++            }
++        } else if (params_base.cache_ram_mib != 0) {
+             if (params_base.cache_ram_mib < 0) {
+                 SRV_TRC("prompt cache is enabled, size limit: %s\n", "no limit");
+             } else {
+@@ -1777,6 +1804,12 @@ private:
+         }
+ 
+         if (ret) {
++            if (persistent_cache && task.params.cache_prompt && !task.is_stateless() && !task.is_child()) {
++                std::vector<uint8_t> state;
++                if (persistent_cache->load(ret->prompt, task.tokens, ctx_tgt, ctx_dft, ret->id, state)) {
++                    common_speculative_set_state(spec.get(), ret->id, state);
++                }
++            }
+             update_cache = update_cache && prompt_cache;
+ 
+             // cache prompts only for the tasks that reuse them
+@@ -2544,7 +2577,7 @@ private:
+     }
+ 
+     // n_tokens_cur: the number of tokens added to the batch for the current slot
+-    void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
++    void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max, bool persist_boundary) {
+         const int id_task = slot.task->id;
+ 
+         // evict checkpoints within min-step of a previous checkpoint, unless they were
+@@ -2603,6 +2636,10 @@ private:
+         // stash the draft's speculative state with the checkpoint
+         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
+ 
++        if (persist_boundary && persistent_cache && slot.task->params.cache_prompt && !slot.task->is_stateless() && !slot.task->is_child() && cur.n_tokens > 0) {
++            persistent_cache->save(slot.prompt, ctx_tgt, ctx_dft, slot.id, cur.data_spec, size_t(cur.n_tokens));
++        }
++
+         SLT_TRC(slot,
+                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                 (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
+@@ -2981,7 +3018,9 @@ private:
+                             n_idle_slots++;
+                         }
+ 
+-                        slots_data.push_back(slot.to_json(slots_debug == 0));
++                        json info = slot.to_json(slots_debug == 0);
++                        if (persistent_cache) info["persistent_cache"] = persistent_cache->stats();
++                        slots_data.push_back(std::move(info));
+                     }
+                     SRV_DBG("n_idle_slots = %d\n", n_idle_slots);
+ 
+@@ -4179,7 +4218,7 @@ private:
+                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not
+                     //       yet processed and therefore it is not part of the checkpoint.
+                     if (do_checkpoint) {
+-                        create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
++                        create_checkpoint(slot, n_tokens_cur, pos_min, pos_max, is_user_start);
+                     }
+                 }
+ 
+diff --git a/tools/server/server-persist.cpp b/tools/server/server-persist.cpp
+new file mode 100644
+index 0000000..bb3aa1b
+--- /dev/null
++++ b/tools/server/server-persist.cpp
+@@ -0,0 +1,1160 @@
++#include "server-persist.h"
++
++#include "ggml-backend.h"
++#include "hash/hash.h"
++#include "llama-ext.h"
++#include "llama-io.h"
++#include "log.h"
++extern "C" {
++#include "hash/sha256/sha256.h"
++}
++#ifdef LLAMA_PERSIST_OPENSSL
++#    include <openssl/evp.h>
++#endif
++#include <fcntl.h>
++#include <link.h>
++#include <sys/file.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++#include <algorithm>
++#include <cerrno>
++#include <chrono>
++#include <condition_variable>
++#include <cstring>
++#include <deque>
++#include <filesystem>
++#include <fstream>
++#include <future>
++#include <limits>
++#include <list>
++#include <mutex>
++#include <set>
++#include <thread>
++#include <unordered_map>
++
++namespace {
++namespace fs                  = std::filesystem;
++constexpr size_t blob_bytes   = 4u << 20;
++constexpr size_t manifest_max = 16u << 20;
++constexpr size_t prefix_step  = 64;
++
++uint64_t stamp() {
++    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch())
++        .count();
++}
++
++bool digest_ok(const std::string & s) {
++    return s.size() == 64 && s.find_first_not_of("0123456789abcdef") == std::string::npos;
++}
++
++void require(bool ok, const char * msg) {
++    if (!ok) {
++        throw std::runtime_error(msg);
++    }
++}
++
++class cache_hasher {
++#ifdef LLAMA_PERSIST_OPENSSL
++    std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> ctx{ EVP_MD_CTX_new(), EVP_MD_CTX_free };
++#else
++    sha256_t ctx;
++#endif
++  public:
++    cache_hasher() {
++#ifdef LLAMA_PERSIST_OPENSSL
++        require(ctx && EVP_DigestInit_ex(ctx.get(), EVP_sha256(), nullptr) == 1, "cannot initialize cache checksum");
++#else
++        sha256_init(&ctx);
++#endif
++    }
++
++    void update(const void * data, size_t size) {
++#ifdef LLAMA_PERSIST_OPENSSL
++        require(EVP_DigestUpdate(ctx.get(), data, size) == 1, "cannot hash cache data");
++#else
++        sha256_update(&ctx, static_cast<const unsigned char *>(data), size);
++#endif
++    }
++
++    std::string finish() {
++        unsigned char digest[32];
++#ifdef LLAMA_PERSIST_OPENSSL
++        unsigned int size = 0;
++        require(EVP_DigestFinal_ex(ctx.get(), digest, &size) == 1 && size == 32, "cannot finish cache checksum");
++#else
++        sha256_final(&ctx, digest);
++#endif
++        std::string  hex;
++        const char * chars = "0123456789abcdef";
++        for (auto c : digest) {
++            hex += chars[c >> 4];
++            hex += chars[c & 15];
++        }
++        return hex;
++    }
++};
++
++std::string cache_hash(const void * data, size_t size) {
++    cache_hasher hash;
++    hash.update(data, size);
++    return hash.finish();
++}
++
++void sync_dir(const fs::path & path) {
++    int fd = open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
++    require(fd >= 0, "cannot open cache directory");
++    int result = fsync(fd);
++    close(fd);
++    require(result == 0, "cannot sync cache directory");
++}
++
++void atomic_file(const fs::path & path, const void * data, size_t size) {
++    fs::path temp = path.string() + ".tmp";
++    int      fd   = open(temp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600);
++    require(fd >= 0, "cannot create cache temporary file");
++    const auto * ptr = static_cast<const uint8_t *>(data);
++    try {
++        while (size) {
++            ssize_t n = write(fd, ptr, size);
++            if (n < 0 && errno == EINTR) {
++                continue;
++            }
++            require(n > 0, "cache write failed");
++            ptr += n;
++            size -= n;
++        }
++        require(fsync(fd) == 0, "cache data sync failed");
++        close(fd);
++        fd = -1;
++        fs::rename(temp, path);
++    } catch (...) {
++        if (fd >= 0) {
++            close(fd);
++        }
++        std::error_code ec;
++        fs::remove(temp, ec);
++        throw;
++    }
++}
++
++std::vector<uint8_t> read_file(const fs::path & path, size_t limit) {
++    int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
++    require(fd >= 0, "cache file missing");
++    struct stat st{};
++    if (fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_size < 0 || uint64_t(st.st_size) > limit) {
++        close(fd);
++        throw std::runtime_error("invalid cache file size");
++    }
++    std::vector<uint8_t> data(size_t(st.st_size));
++    size_t               pos = 0;
++    while (pos < data.size()) {
++        ssize_t n = read(fd, data.data() + pos, data.size() - pos);
++        if (n < 0 && errno == EINTR) {
++            continue;
++        }
++        if (n <= 0) {
++            close(fd);
++            throw std::runtime_error("truncated cache file");
++        }
++        pos += size_t(n);
++    }
++    close(fd);
++    return data;
++}
++
++void root_prepare(const fs::path & root) {
++    fs::create_directories(root);
++    auto marker = root / ".llama-persist-format";
++    if (!fs::exists(marker)) {
++        require(fs::is_empty(root), "persistent cache requires an empty dedicated directory");
++        const std::string value = "llama-persist-1\n";
++        atomic_file(marker, value.data(), value.size());
++        sync_dir(root);
++    }
++    auto data = read_file(marker, 64);
++    require(std::string(data.begin(), data.end()) == "llama-persist-1\n", "unknown persistent cache directory format");
++    require(chmod(root.c_str(), 0700) == 0, "cannot secure cache directory");
++}
++
++json manifest_read(const fs::path & path) {
++    auto        data     = read_file(path, manifest_max);
++    json        result   = json::parse(std::string(data.begin(), data.end()));
++    std::string checksum = result.at("checksum");
++    result.erase("checksum");
++    auto canonical = result.dump();
++    require(checksum == cache_hash(canonical.data(), canonical.size()), "cache manifest checksum mismatch");
++    return result;
++}
++
++void manifest_write(const fs::path & path, json value) {
++    auto canonical    = value.dump();
++    value["checksum"] = cache_hash(canonical.data(), canonical.size());
++    auto data         = value.dump();
++    require(data.size() <= manifest_max, "cache manifest too large");
++    atomic_file(path, data.data(), data.size());
++    sync_dir(path.parent_path());
++}
++
++std::vector<std::string> prefix_hashes(const server_tokens & tokens) {
++    std::vector<std::string> result;
++    std::string              chain, block;
++    std::string              media_id;
++    size_t                   media_end = 0;
++    for (size_t i = 0; i < tokens.size(); ++i) {
++        llama_token t = tokens[i];
++        block.append(reinterpret_cast<const char *>(&t), sizeof(t));
++        if (t == LLAMA_TOKEN_NULL) {
++            if (i >= media_end) {
++                const auto & media = tokens.find_chunk(i);
++                require(bool(media), "missing media identity");
++                media_id  = mtmd_input_chunk_get_id(media.get());
++                media_end = i + mtmd_input_chunk_get_n_tokens(media.get());
++                require(media_end > i && media_end <= tokens.size(), "invalid media span");
++            }
++            require(media_id.size() <= 4096, "media identity too large");
++            uint64_t n = media_id.size();
++            block.append(reinterpret_cast<const char *>(&n), sizeof(n));
++            block += media_id;
++        }
++        if ((i + 1) % prefix_step == 0) {
++            auto bytes = chain + block;
++            chain      = cache_hash(bytes.data(), bytes.size());
++            result.push_back(chain);
++            block.clear();
++        }
++    }
++    return result;
++}
++
++// A recurrent state can rewind only to a retained checkpoint, not to any attention cell.
++size_t reusable(const server_prompt & prompt, const server_tokens & incoming, bool hybrid) {
++    size_t common = prompt.tokens.get_common_prefix(incoming);
++    if (!hybrid) {
++        return common;
++    }
++    size_t limit = std::min(common, incoming.size() ? incoming.size() - 1 : 0);
++    if (prompt.tokens.size() <= limit) {
++        return prompt.tokens.size();
++    }
++    size_t best = 0;
++    for (const auto & c : prompt.checkpoints) {
++        if (c.n_tokens >= 0 && size_t(c.n_tokens) <= limit) {
++            best = std::max(best, size_t(c.n_tokens));
++        }
++    }
++    return best;
++}
++}  // namespace
++
++struct server_persistent_cache::impl {
++    server_persist_options        options;
++    fs::path                      root, objects, entries;
++    int                           lock_fd = -1;
++    std::map<std::string, json>   index;
++    std::map<std::string, size_t> sizes, references;
++    std::set<std::string>         transaction, corrupt, verified;
++    uint64_t                      used           = 0;
++    size_t                        metadata_bytes = 0;
++
++    struct job {
++        std::string                           hash;
++        std::shared_ptr<std::vector<uint8_t>> bytes;
++    };
++
++    struct hot_item {
++        std::shared_ptr<std::vector<uint8_t>> bytes;
++        std::list<std::string>::iterator      order;
++    };
++
++    std::unordered_map<std::string, hot_item> hot;
++    std::list<std::string>                    order;
++    size_t                  hot_bytes = 0, queued_bytes = 0, peak_hot_bytes = 0, peak_queued_bytes = 0;
++    std::deque<job>         jobs;
++    std::mutex              mutex;
++    std::condition_variable changed;
++    bool                    stopping = false;
++    std::string             error;
++    std::thread             worker;
++    uint64_t saved_bytes = 0, reused_bytes = 0, read_bytes = 0, ram_read_bytes = 0, evictions = 0, saves = 0, hits = 0,
++             misses = 0, gpu_hits = 0, verification_read_bytes = 0;
++
++    explicit impl(const server_persist_options & opts) :
++        options(opts),
++        root(opts.directory),
++        objects(root / "objects"),
++        entries(root / "entries") {
++        require(opts.ram_bytes >= 64 * 1024 * 1024, "persistent RAM budget must be at least 64 MiB");
++        require(opts.max_bytes > 0 && opts.target_bytes <= opts.max_bytes, "invalid persistent disk watermarks");
++        root_prepare(root);
++        lock_fd = open((root / ".writer.lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
++        require(lock_fd >= 0, "cannot open persistent cache lock");
++        if (flock(lock_fd, LOCK_EX | LOCK_NB)) {
++            close(lock_fd);
++            lock_fd = -1;
++            throw std::runtime_error("persistent cache already has a writer; use a separate directory");
++        }
++        try {
++            fs::create_directories(objects);
++            fs::create_directories(entries);
++            for (const auto & f : fs::directory_iterator(objects)) {
++                auto name = f.path().filename().string();
++                if (f.path().extension() == ".tmp") {
++                    fs::remove(f.path());
++                    continue;
++                }
++                if (f.path().extension() == ".bin" && digest_ok(f.path().stem().string()) && !f.is_symlink()) {
++                    size_t n = f.file_size();
++                    if (n > 0 && n <= blob_bytes) {
++                        sizes[f.path().stem().string()] = n;
++                        used += n;
++                    } else {
++                        fs::remove(f.path());
++                    }
++                }
++            }
++            for (const auto & f : fs::directory_iterator(entries)) {
++                if (f.path().extension() == ".tmp") {
++                    fs::remove(f.path());
++                    continue;
++                }
++                if (f.path().extension() != ".json" || !digest_ok(f.path().stem().string())) {
++                    continue;
++                }
++                try {
++                    json value = manifest_read(f.path());
++                    validate(value);
++                    metadata_bytes += manifest_bytes(value);
++                    visit(value, [&](const std::string & h, size_t) { ++references[h]; });
++                    index[f.path().stem().string()] = std::move(value);
++                    while (metadata_bytes * 8 > metadata_limit()) {
++                        if (!evict(false)) {
++                            break;
++                        }
++                    }
++                } catch (const std::exception & e) {
++                    SRV_WRN("discarding invalid persistent entry: %s\n", e.what());
++                    fs::remove(f.path());
++                }
++            }
++            collect();
++            while (used + metadata_bytes > options.max_bytes || metadata_bytes * 8 > metadata_limit()) {
++                if (!evict()) {
++                    break;
++                }
++            }
++            worker = std::thread([this] { run(); });
++            SRV_INF("persistent cache: %zu entries, %.3f GiB, RAM limit %.0f MiB\n", index.size(),
++                    used / double(1ull << 30), options.ram_bytes / double(1ull << 20));
++        } catch (...) {
++            close(lock_fd);
++            lock_fd = -1;
++            throw;
++        }
++    }
++
++    ~impl() {
++        {
++            std::lock_guard<std::mutex> guard(mutex);
++            stopping = true;
++            changed.notify_all();
++        }
++        if (worker.joinable()) {
++            worker.join();
++        }
++        if (lock_fd >= 0) {
++            close(lock_fd);
++        }
++    }
++
++    static size_t manifest_bytes(const json & value) { return value.dump().size() + 78; }
++
++    size_t metadata_limit() const { return std::min<size_t>(64u << 20, options.ram_bytes / 4); }
++
++    size_t staging_limit() const { return std::min<size_t>(64u << 20, options.ram_bytes / 8); }
++
++    size_t pool_limit() const {
++        return (options.ram_bytes - metadata_limit() - 2 * staging_limit() - 2 * blob_bytes) / 2;
++    }
++
++    template <class F> static void visit_stream(const json & stream, F fn) {
++        uint64_t total = 0;
++        require(stream.at("chunks").is_array() && stream["chunks"].size() <= 65536, "invalid cache chunk count");
++        for (const auto & c : stream["chunks"]) {
++            require(c.is_array() && c.size() == 2, "invalid cache chunk");
++            std::string h = c[0];
++            uint64_t    n = c[1].get<uint64_t>();
++            require(digest_ok(h) && n > 0 && n <= blob_bytes, "invalid cache object");
++            require(total <= UINT64_MAX - n, "cache stream overflow");
++            total += n;
++            fn(h, size_t(n));
++        }
++        require(total == stream.at("bytes").get<uint64_t>(), "cache stream size mismatch");
++    }
++
++    template <class F> static void visit(const json & value, F fn) {
++        for (const char * key : { "target", "draft", "spec", "tokens" }) {
++            visit_stream(value.at(key), fn);
++        }
++        for (const auto & c : value.at("checkpoints")) {
++            for (const char * key : { "target", "draft", "spec" }) {
++                visit_stream(c.at(key), fn);
++            }
++        }
++    }
++
++    void validate(const json & v) {
++        require(v.at("version") == 1 && digest_ok(v.at("identity")), "incompatible cache manifest");
++        uint64_t n = v.at("n_tokens").get<uint64_t>();
++        require(n > 0 && n <= (4u << 20), "invalid cache token count");
++        require(v.at("prefixes").is_array() && v.at("prefixes").size() == n / prefix_step,
++                "invalid cache prefix count");
++        for (const auto & h : v.at("prefixes")) {
++            require(digest_ok(h), "invalid cache prefix hash");
++        }
++        require(v.at("hits").get<int64_t>() >= 0 && v.at("access").get<int64_t>() >= 0,
++                "invalid cache eviction metadata");
++        require(v.at("checkpoints").is_array() && v["checkpoints"].size() <= 1024, "too many cached checkpoints");
++        for (const auto & c : v["checkpoints"]) {
++            require(c.at("n_tokens").get<int64_t>() >= 0 && c.at("n_tokens").get<uint64_t>() <= n,
++                    "invalid checkpoint boundary");
++        }
++        visit(v, [&](const std::string & h, size_t bytes) {
++            require(sizes.count(h) && sizes.at(h) == bytes, "missing persistent object");
++        });
++    }
++
++    void invalidate_corrupt() {
++        std::set<std::string> bad;
++        {
++            std::lock_guard<std::mutex> guard(mutex);
++            bad.swap(corrupt);
++        }
++        if (bad.empty()) {
++            return;
++        }
++        std::vector<std::string> invalid;
++        for (const auto & item : index) {
++            bool found = false;
++            visit(item.second, [&](const std::string & h, size_t) {
++                if (bad.count(h)) {
++                    found = true;
++                }
++            });
++            if (found) {
++                invalid.push_back(item.first);
++            }
++        }
++        for (const auto & id : invalid) {
++            remove_entry(id);
++        }
++    }
++
++    void collect() {
++        for (auto it = sizes.begin(); it != sizes.end();) {
++            if (!references[it->first] && !transaction.count(it->first)) {
++                fs::remove(objects / (it->first + ".bin"));
++                used -= it->second;
++                {
++                    std::lock_guard<std::mutex> guard(mutex);
++                    verified.erase(it->first);
++                }
++                references.erase(it->first);
++                it = sizes.erase(it);
++            } else {
++                ++it;
++            }
++        }
++    }
++
++    void remove_entry(const std::string & id, bool gc = true) {
++        auto it = index.find(id);
++        if (it == index.end()) {
++            return;
++        }
++        visit(it->second, [&](const std::string & h, size_t) {
++            if (references[h]) {
++                --references[h];
++            }
++        });
++        metadata_bytes -= manifest_bytes(it->second);
++        fs::remove(entries / (id + ".json"));
++        index.erase(it);
++        if (gc) {
++            collect();
++        }
++    }
++
++    bool evict(bool gc = true) {
++        if (index.empty()) {
++            return false;
++        }
++        auto best = std::min_element(index.begin(), index.end(), [](const auto & a, const auto & b) {
++            return std::make_pair(a.second.value("hits", 0) > 0, a.second.value("access", uint64_t(0))) <
++                   std::make_pair(b.second.value("hits", 0) > 0, b.second.value("access", uint64_t(0)));
++        });
++        remove_entry(best->first, gc);
++        ++evictions;
++        return true;
++    }
++
++    size_t pending_bytes() {
++        std::lock_guard<std::mutex> guard(mutex);
++        return queued_bytes;
++    }
++
++    void space(size_t incoming) {
++        auto available = [&] {
++            return fs::space(root).available;
++        };
++        if (used + metadata_bytes + incoming > options.max_bytes ||
++            available() < options.min_free_bytes + incoming + pending_bytes()) {
++            drain();
++            while (used + metadata_bytes + incoming > options.target_bytes ||
++                   available() < options.min_free_bytes + incoming) {
++                if (!evict()) {
++                    break;
++                }
++            }
++            require(used + metadata_bytes + incoming <= options.max_bytes &&
++                        available() >= options.min_free_bytes + incoming,
++                    "persistent cache quota or free-space limit");
++        }
++    }
++
++    void run() {
++        for (;;) {
++            job current;
++            {
++                std::unique_lock<std::mutex> guard(mutex);
++                changed.wait(guard, [&] { return stopping || !jobs.empty(); });
++                if (jobs.empty()) {
++                    if (stopping) {
++                        return;
++                    }
++                    continue;
++                }
++                current = std::move(jobs.front());
++                jobs.pop_front();
++            }
++            std::string failure;
++            try {
++                atomic_file(objects / (current.hash + ".bin"), current.bytes->data(), current.bytes->size());
++            } catch (const std::exception & e) {
++                failure = e.what();
++            }
++            {
++                std::lock_guard<std::mutex> guard(mutex);
++                if (!failure.empty()) {
++                    error = failure;
++                } else {
++                    saved_bytes += current.bytes->size();
++                }
++                queued_bytes -= current.bytes->capacity();
++                changed.notify_all();
++            }
++        }
++    }
++
++    void drain() {
++        std::unique_lock<std::mutex> guard(mutex);
++        changed.wait(guard, [&] { return queued_bytes == 0; });
++        require(error.empty(), error.c_str());
++    }
++
++    std::string put(std::vector<uint8_t> data) {
++        std::string h = cache_hash(data.data(), data.size());
++        transaction.insert(h);
++        const bool exists = sizes.count(h) != 0;
++        if (exists) {
++            bool valid;
++            {
++                std::lock_guard<std::mutex> guard(mutex);
++                valid = verified.count(h) != 0;
++            }
++            if (!valid) {
++                try {
++                    auto previous = read_file(objects / (h + ".bin"), blob_bytes);
++                    verification_read_bytes += previous.size();
++                    valid = previous == data;
++                } catch (...) {
++                }
++            }
++            if (valid) {
++                std::lock_guard<std::mutex> guard(mutex);
++                verified.insert(h);
++                reused_bytes += data.size();
++                return h;
++            }
++        }
++        data.shrink_to_fit();
++        space(data.size());
++        std::unique_lock<std::mutex> guard(mutex);
++        changed.wait(guard, [&] {
++            return (queued_bytes + data.capacity() <= pool_limit() && jobs.size() < 256) || !error.empty();
++        });
++        require(error.empty(), error.c_str());
++        queued_bytes += data.capacity();
++        peak_queued_bytes = std::max(peak_queued_bytes, queued_bytes);
++        verified.insert(h);
++        if (!exists) {
++            sizes[h] = data.size();
++            used += data.size();
++        }
++        jobs.push_back({ h, std::make_shared<std::vector<uint8_t>>(std::move(data)) });
++        changed.notify_all();
++        return h;
++    }
++
++    std::shared_ptr<std::vector<uint8_t>> get(const std::string & h, size_t expected) {
++        {
++            std::lock_guard<std::mutex> guard(mutex);
++            auto                        it = hot.find(h);
++            if (it != hot.end()) {
++                order.splice(order.end(), order, it->second.order);
++                ram_read_bytes += expected;
++                return it->second.bytes;
++            }
++        }
++        std::shared_ptr<std::vector<uint8_t>> data;
++        try {
++            data = std::make_shared<std::vector<uint8_t>>(read_file(objects / (h + ".bin"), blob_bytes));
++            require(data->size() == expected && cache_hash(data->data(), data->size()) == h,
++                    "persistent object checksum mismatch");
++        } catch (...) {
++            std::lock_guard<std::mutex> guard(mutex);
++            corrupt.insert(h);
++            throw;
++        }
++        {
++            std::lock_guard<std::mutex> guard(mutex);
++            verified.insert(h);
++            read_bytes += data->size();
++            if (!options.cache_hot) {
++                return data;
++            }
++            auto found = hot.find(h);
++            if (found != hot.end()) {
++                order.splice(order.end(), order, found->second.order);
++                return found->second.bytes;
++            }
++            while (!order.empty() && hot_bytes + data->size() > pool_limit()) {
++                auto it = hot.find(order.front());
++                hot_bytes -= it->second.bytes->size();
++                hot.erase(it);
++                order.pop_front();
++            }
++            order.push_back(h);
++            hot[h] = { data, std::prev(order.end()) };
++            hot_bytes += data->size();
++            peak_hot_bytes = std::max(peak_hot_bytes, hot_bytes);
++        }
++        return data;
++    }
++
++    struct writer : llama_io_write_i {
++        impl & store;
++        json   result = {
++            { "chunks", json::array() },
++            { "bytes",  0             }
++        };
++        std::vector<uint8_t> buffer;
++        size_t               count = 0;
++
++        explicit writer(impl & s) : store(s) { buffer.reserve(blob_bytes); }
++
++        void flush() {
++            if (buffer.empty()) {
++                return;
++            }
++            size_t n = buffer.size();
++            auto   h = store.put(std::move(buffer));
++            result["chunks"].push_back(json::array({ h, n }));
++            buffer.clear();
++            buffer.reserve(blob_bytes);
++        }
++
++        void write(const void * src, size_t n) override {
++            const auto * data = static_cast<const uint8_t *>(src);
++            count += n;
++            while (n) {
++                size_t step = std::min(n, blob_bytes - buffer.size());
++                buffer.insert(buffer.end(), data, data + step);
++                data += step;
++                n -= step;
++                if (buffer.size() == blob_bytes) {
++                    flush();
++                }
++            }
++        }
++
++        void write_tensor(ggml_tensor * t, size_t offset, size_t n) override {
++            // Keep tensor boundaries stable when a cached sequence grows.
++            flush();
++            size_t row = t->nb[1];
++            require(row > 0, "invalid state tensor row");
++            size_t step = std::max(row, (blob_bytes / row) * row);
++            require(step <= store.staging_limit(), "state tensor row exceeds staging limit");
++            std::vector<uint8_t> staging(std::min(step, n));
++            while (n) {
++                size_t take = std::min(step, n);
++                ggml_backend_tensor_get(t, staging.data(), offset, take);
++                write(staging.data(), take);
++                offset += take;
++                n -= take;
++            }
++            flush();
++        }
++
++        size_t n_bytes() override { return count; }
++
++        json finish() {
++            flush();
++            result["bytes"] = count;
++            return result;
++        }
++    };
++
++    struct reader : llama_io_read_i {
++        impl &                                             store;
++        json                                               stream;
++        size_t                                             chunk = 0, pos = 0, count = 0;
++        std::shared_ptr<std::vector<uint8_t>>              current;
++        std::future<std::shared_ptr<std::vector<uint8_t>>> next;
++
++        reader(impl & s, const json & value) : store(s), stream(value) { prefetch(); }
++
++        void prefetch() {
++            if (chunk < stream["chunks"].size()) {
++                auto part = stream["chunks"][chunk++];
++                next      = std::async(std::launch::async, [this, part] {
++                    return store.get(part[0].get<std::string>(), part[1].get<size_t>());
++                });
++            }
++        }
++
++        void read(void * dst, size_t n) override {
++            require(n <= stream.at("bytes").get<uint64_t>() - count, "truncated persistent state");
++            auto * output = static_cast<uint8_t *>(dst);
++            while (n) {
++                if (!current) {
++                    current = next.get();
++                    prefetch();
++                    pos = 0;
++                }
++                size_t step = std::min(n, current->size() - pos);
++                memcpy(output, current->data() + pos, step);
++                pos += step;
++                count += step;
++                output += step;
++                n -= step;
++                if (pos == current->size()) {
++                    current.reset();
++                }
++            }
++        }
++
++        void read_tensor(ggml_tensor * t, size_t offset, size_t n) override {
++            size_t row = t->nb[1];
++            require(row > 0, "invalid state tensor row");
++            size_t step = std::max(row, (blob_bytes / row) * row);
++            require(step <= store.staging_limit(), "state tensor row exceeds staging limit");
++            std::vector<uint8_t> staging(std::min(step, n));
++            while (n) {
++                size_t take = std::min(step, n);
++                read(staging.data(), take);
++                ggml_backend_tensor_set(t, staging.data(), offset, take);
++                offset += take;
++                n -= take;
++            }
++        }
++
++        size_t n_bytes() override { return count; }
++    };
++
++    json bytes(const void * data, size_t size) {
++        writer w(*this);
++        w.write(data, size);
++        return w.finish();
++    }
++
++    std::vector<uint8_t> bytes(const json & stream, size_t limit) {
++        require(stream["bytes"].get<uint64_t>() <= limit, "persistent auxiliary state too large");
++        std::vector<uint8_t> data(stream["bytes"].get<size_t>());
++        reader               in(*this, stream);
++        in.read(data.data(), data.size());
++        return data;
++    }
++};
++
++server_persistent_cache::server_persistent_cache(const server_persist_options & options) : p(new impl(options)) {}
++
++server_persistent_cache::~server_persistent_cache() = default;
++
++bool server_persistent_cache::save(const server_prompt &        prompt,
++                                   llama_context *              target,
++                                   llama_context *              draft,
++                                   llama_seq_id                 seq,
++                                   const std::vector<uint8_t> & spec,
++                                   size_t                       prefix_tokens) {
++    auto started = stamp();
++    try {
++        auto tokens = prompt.tokens.clone();
++        if (prefix_tokens) {
++            tokens.keep_first(prefix_tokens);
++        }
++        if (tokens.size() < prefix_step) {
++            return false;
++        }
++        auto        packed = tokens.serialize();
++        std::string key    = p->options.identity + cache_hash(packed.data(), packed.size());
++        key                = cache_hash(key.data(), key.size());
++        auto existing      = p->index.find(key);
++        if (existing != p->index.end()) {
++            existing->second["access"] = stamp();
++            manifest_write(p->entries / (key + ".json"), existing->second);
++            return true;
++        }
++        p->transaction.clear();
++        json value = {
++            { "version",     1                     },
++            { "identity",    p->options.identity   },
++            { "n_tokens",    tokens.size()         },
++            { "prefixes",    prefix_hashes(tokens) },
++            { "access",      stamp()               },
++            { "hits",        0                     },
++            { "checkpoints", json::array()         }
++        };
++        {
++            impl::writer out(*p);
++            require(llama_state_seq_write_io(target, seq, out) > 0, "target state save failed");
++            value["target"] = out.finish();
++        }
++        {
++            impl::writer out(*p);
++            if (draft) {
++                require(llama_state_seq_write_io(draft, seq, out) > 0, "draft state save failed");
++            }
++            value["draft"] = out.finish();
++        }
++        value["tokens"] = p->bytes(packed.data(), packed.size());
++        value["spec"]   = p->bytes(spec.data(), spec.size());
++        for (const auto & c : prompt.checkpoints) {
++            if (c.n_tokens > int64_t(tokens.size())) {
++                continue;
++            }
++            value["checkpoints"].push_back({
++                { "n_tokens", c.n_tokens },
++                { "pos_min", c.pos_min },
++                { "pos_max", c.pos_max },
++                { "target", p->bytes(c.data_tgt.data(), c.data_tgt.size()) },
++                { "draft", p->bytes(c.data_dft.data(), c.data_dft.size()) },
++                { "spec", p->bytes(c.data_spec.data(), c.data_spec.size()) }
++            });
++        }
++        p->drain();
++        p->space(impl::manifest_bytes(value));
++        sync_dir(p->objects);
++        manifest_write(p->entries / (key + ".json"), value);
++        impl::visit(value, [&](const std::string & h, size_t) { ++p->references[h]; });
++        p->metadata_bytes += impl::manifest_bytes(value);
++        p->index[key] = std::move(value);
++        p->transaction.clear();
++        ++p->saves;
++        while (p->metadata_bytes * 8 > p->metadata_limit() || p->used + p->metadata_bytes > p->options.max_bytes) {
++            if (!p->evict()) {
++                break;
++            }
++        }
++        SRV_INF("persistent save: %zu tokens, %.2f ms, disk %.3f GiB\n", tokens.size(), (stamp() - started) / 1e6,
++                p->used / double(1ull << 30));
++        return true;
++    } catch (const std::exception & e) {
++        SRV_WRN("persistent save skipped: %s\n", e.what());
++        try {
++            p->drain();
++        } catch (...) {
++        }
++        {
++            std::lock_guard<std::mutex> guard(p->mutex);
++            for (const auto & h : p->transaction) {
++                p->verified.erase(h);
++            }
++        }
++        p->transaction.clear();
++        try {
++            p->collect();
++        } catch (const std::exception & failure) {
++            SRV_WRN("persistent cleanup failed: %s\n", failure.what());
++        }
++        {
++            std::lock_guard<std::mutex> guard(p->mutex);
++            p->error.clear();
++        }
++        return false;
++    }
++}
++
++bool server_persistent_cache::load(server_prompt &        prompt,
++                                   const server_tokens &  incoming,
++                                   llama_context *        target,
++                                   llama_context *        draft,
++                                   llama_seq_id           seq,
++                                   std::vector<uint8_t> & spec) {
++    bool   hybrid = llama_model_is_hybrid(llama_get_model(target)) || llama_model_is_recurrent(llama_get_model(target));
++    auto   hashes = prefix_hashes(incoming);
++    size_t best   = reusable(prompt, incoming, hybrid);
++    std::string              selected;
++    uint64_t                 best_bytes = UINT64_MAX;
++    std::vector<std::string> invalid;
++    for (const auto & item : p->index) {
++        const auto & v = item.second;
++        if (v["identity"] != p->options.identity) {
++            continue;
++        }
++        size_t       matched = 0;
++        const auto & old     = v["prefixes"];
++        while (matched < std::min(hashes.size(), old.size()) && hashes[matched] == old[matched].get<std::string>()) {
++            ++matched;
++        }
++        size_t upper = std::min(incoming.size(), v["n_tokens"].get<size_t>());
++        if ((matched + 1) * prefix_step < best || matched == 0) {
++            continue;
++        }
++        upper = std::min(upper, (matched + 1) * prefix_step - 1);
++        if (upper < best) {
++            continue;
++        }
++        try {
++            auto data = p->bytes(v["tokens"], 64u << 20);
++            require(data.size() % sizeof(llama_token) == 0, "invalid packed persistent tokens");
++            llama_tokens words(data.size() / sizeof(llama_token));
++            memcpy(words.data(), data.data(), data.size());
++            server_prompt candidate;
++            candidate.tokens = server_tokens::deserialize(words, incoming.has_mtmd);
++            for (const auto & c : v["checkpoints"]) {
++                common_prompt_checkpoint ck{};
++                ck.n_tokens = c["n_tokens"].get<int64_t>();
++                candidate.checkpoints.push_back(std::move(ck));
++            }
++            size_t   score = reusable(candidate, incoming, hybrid);
++            uint64_t size  = v["target"]["bytes"].get<uint64_t>();
++            if (score > best || (score == best && !selected.empty() && size < best_bytes)) {
++                best       = score;
++                best_bytes = size;
++                selected   = item.first;
++            }
++        } catch (const std::exception & e) {
++            SRV_WRN("persistent lookup rejected: %s\n", e.what());
++            invalid.push_back(item.first);
++        }
++    }
++    for (const auto & id : invalid) {
++        p->remove_entry(id);
++    }
++    p->invalidate_corrupt();
++    if (selected.empty()) {
++        if (best > 0) {
++            ++p->gpu_hits;
++        } else {
++            ++p->misses;
++        }
++        return false;
++    }
++    auto before     = p->read_bytes;
++    auto before_ram = p->ram_read_bytes;
++    auto started    = stamp();
++    try {
++        json &        v = p->index.at(selected);
++        server_prompt restored;
++        prompt.checkpoints.clear();
++        auto         data = p->bytes(v["tokens"], 64u << 20);
++        llama_tokens words(data.size() / sizeof(llama_token));
++        memcpy(words.data(), data.data(), data.size());
++        restored.tokens = server_tokens::deserialize(words, incoming.has_mtmd);
++        for (const auto & c : v["checkpoints"]) {
++            common_prompt_checkpoint ck{};
++            ck.id_task   = -1;
++            ck.n_tokens  = c["n_tokens"].get<int64_t>();
++            ck.pos_min   = c["pos_min"].get<llama_pos>();
++            ck.pos_max   = c["pos_max"].get<llama_pos>();
++            ck.data_tgt  = p->bytes(c["target"], 1ull << 30);
++            ck.data_dft  = p->bytes(c["draft"], 1ull << 30);
++            ck.data_spec = p->bytes(c["spec"], 64u << 20);
++            restored.checkpoints.push_back(std::move(ck));
++        }
++        {
++            impl::reader in(*p, v["target"]);
++            require(llama_state_seq_read_io(target, seq, in) == v["target"]["bytes"].get<size_t>(),
++                    "target persistent restore failed");
++        }
++        if (draft && v["draft"]["bytes"].get<size_t>()) {
++            impl::reader in(*p, v["draft"]);
++            require(llama_state_seq_read_io(draft, seq, in) == v["draft"]["bytes"].get<size_t>(),
++                    "draft persistent restore failed");
++        }
++        spec                  = p->bytes(v["spec"], 64u << 20);
++        prompt                = std::move(restored);
++        size_t previous_bytes = impl::manifest_bytes(v);
++        v["hits"]             = v.value("hits", uint64_t(0)) + 1;
++        v["access"]           = stamp();
++        try {
++            manifest_write(p->entries / (selected + ".json"), v);
++        } catch (const std::exception & e) {
++            SRV_WRN("persistent access update skipped: %s\n", e.what());
++        }
++        p->metadata_bytes += impl::manifest_bytes(v) - previous_bytes;
++        ++p->hits;
++        SRV_INF("persistent hit: reusable=%zu, disk_read=%llu, ram_read=%llu, %.2f ms\n", best,
++                (unsigned long long) (p->read_bytes - before), (unsigned long long) (p->ram_read_bytes - before_ram),
++                (stamp() - started) / 1e6);
++        return true;
++    } catch (const std::exception & e) {
++        SRV_WRN("persistent restore rejected: %s\n", e.what());
++        llama_memory_seq_rm(llama_get_memory(target), seq, -1, -1);
++        if (draft) {
++            llama_memory_seq_rm(llama_get_memory(draft), seq, -1, -1);
++        }
++        prompt.clear();
++        try {
++            p->remove_entry(selected);
++            p->invalidate_corrupt();
++        } catch (const std::exception & failure) {
++            SRV_WRN("persistent cleanup failed: %s\n", failure.what());
++        }
++        ++p->misses;
++        return false;
++    }
++}
++
++json server_persistent_cache::stats() const {
++    std::lock_guard<std::mutex> guard(p->mutex);
++    return {
++#ifdef LLAMA_PERSIST_OPENSSL
++        { "checksum",                   "sha256-openssl"                           },
++#else
++        { "checksum", "sha256-portable" },
++#endif
++        { "entries",                    p->index.size()                            },
++        { "disk_bytes",                 p->used + p->metadata_bytes                },
++        { "metadata_bytes",             p->metadata_bytes                          },
++        { "ram_hot_bytes",              p->hot_bytes                               },
++        { "queued_bytes",               p->queued_bytes                            },
++        { "peak_ram_hot_bytes",         p->peak_hot_bytes                          },
++        { "peak_queued_bytes",          p->peak_queued_bytes                       },
++        { "ram_hot_limit_bytes",        p->options.cache_hot ? p->pool_limit() : 0 },
++        { "queue_limit_bytes",          p->pool_limit()                            },
++        { "tensor_staging_limit_bytes", p->staging_limit()                         },
++        { "ram_budget_bytes",           p->options.ram_bytes                       },
++        { "disk_limit_bytes",           p->options.max_bytes                       },
++        { "saved_bytes",                p->saved_bytes                             },
++        { "deduplicated_bytes",         p->reused_bytes                            },
++        { "verification_read_bytes",    p->verification_read_bytes                 },
++        { "disk_read_bytes",            p->read_bytes                              },
++        { "ram_read_bytes",             p->ram_read_bytes                          },
++        { "saves",                      p->saves                                   },
++        { "hits",                       p->hits                                    },
++        { "gpu_hits",                   p->gpu_hits                                },
++        { "misses",                     p->misses                                  },
++        { "evictions",                  p->evictions                               }
++    };
++}
++
++std::string server_persistent_cache::identity(const common_params & params) {
++    root_prepare(params.cache_dir_path);
++    fs::path root = params.cache_dir_path;
++    int      fd   = open((root / ".identity.lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
++    require(fd >= 0, "cannot open cache identity lock");
++    try {
++        require(flock(fd, LOCK_EX) == 0, "cannot lock cache identity");
++        json memo = json::object();
++        try {
++            auto data = read_file(root / "identities.json", manifest_max);
++            memo      = json::parse(std::string(data.begin(), data.end()));
++        } catch (...) {
++        }
++        auto file_id = [&](const std::string & name) {
++            if (name.empty()) {
++                return std::string();
++            }
++            struct stat st{};
++            require(stat(name.c_str(), &st) == 0, "cannot stat cache identity input");
++            json key = json::array({ st.st_dev, st.st_ino, st.st_size, st.st_mtim.tv_sec, st.st_mtim.tv_nsec,
++                                     st.st_ctim.tv_sec, st.st_ctim.tv_nsec });
++            if (memo.contains(name) && memo[name].value("stat", json()) == key &&
++                digest_ok(memo[name].value("sha256", std::string()))) {
++                return memo[name]["sha256"].get<std::string>();
++            }
++            std::ifstream in(name, std::ios::binary);
++            require(bool(in), "cannot hash cache identity input");
++            cache_hasher               sha;
++            std::vector<unsigned char> buffer(1u << 20);
++            while (in) {
++                in.read(reinterpret_cast<char *>(buffer.data()), buffer.size());
++                sha.update(buffer.data(), size_t(in.gcount()));
++            }
++            require(in.eof(), "cache identity read failed");
++            std::string hex = sha.finish();
++            struct stat after{};
++            require(stat(name.c_str(), &after) == 0 && st.st_size == after.st_size &&
++                        st.st_mtim.tv_sec == after.st_mtim.tv_sec && st.st_mtim.tv_nsec == after.st_mtim.tv_nsec &&
++                        st.st_ctim.tv_sec == after.st_ctim.tv_sec && st.st_ctim.tv_nsec == after.st_ctim.tv_nsec,
++                    "cache identity input changed during hashing");
++            memo[name] = {
++                { "stat",   key },
++                { "sha256", hex }
++            };
++            return hex;
++        };
++        json value = {
++            { "format",     1                                              },
++            { "target",     file_id(params.model.path)                     },
++            { "draft",      file_id(params.speculative.draft.mparams.path) },
++            { "mmproj",     file_id(params.mmproj.path)                    },
++            { "ctx",        params.n_ctx                                   },
++            { "parallel",   params.n_parallel                              },
++            { "ubatch",     params.n_ubatch                                },
++            { "batch",      params.n_batch                                 },
++            { "cache_k",    int(params.cache_type_k)                       },
++            { "cache_v",    int(params.cache_type_v)                       },
++            { "draft_k",    int(params.speculative.draft.cache_type_k)     },
++            { "draft_v",    int(params.speculative.draft.cache_type_v)     },
++            { "image_min",  params.image_min_tokens                        },
++            { "image_max",  params.image_max_tokens                        },
++            { "split_mode", int(params.split_mode)                         },
++            { "rope_base",  params.rope_freq_base                          },
++            { "rope_scale", params.rope_freq_scale                         },
++            { "swa_full",   params.swa_full                                }
++        };
++        value["tensor_split"] = std::vector<float>(params.tensor_split, params.tensor_split + 128);
++        value["rope_type"]    = int(params.rope_scaling_type);
++        value["yarn"]         = json::array({ params.yarn_orig_ctx, params.yarn_ext_factor, params.yarn_attn_factor,
++                                              params.yarn_beta_fast, params.yarn_beta_slow });
++        value["gpu_vision"]   = params.mmproj_use_gpu;
++        value["draft_n_max"]  = params.speculative.draft.n_max;
++        std::vector<std::string> libraries;
++        dl_iterate_phdr(
++            [](dl_phdr_info * info, size_t, void * data) {
++                std::string n = info->dlpi_name;
++                if (n.find("libllama") != std::string::npos || n.find("libggml") != std::string::npos ||
++                    n.find("libmtmd") != std::string::npos) {
++                    static_cast<std::vector<std::string> *>(data)->push_back(n);
++                }
++                return 0;
++            },
++            &libraries);
++        libraries.push_back("/proc/self/exe");
++        std::sort(libraries.begin(), libraries.end());
++        for (const auto & name : libraries) {
++            value["runtime"][fs::path(name).filename().string()] = file_id(name);
++        }
++        std::string data = memo.dump();
++        atomic_file(root / "identities.json", data.data(), data.size());
++        auto result = value.dump();
++        close(fd);
++        return cache_hash(result.data(), result.size());
++    } catch (...) {
++        close(fd);
++        throw;
++    }
++}
+diff --git a/tools/server/server-persist.h b/tools/server/server-persist.h
+new file mode 100644
+index 0000000..b2195db
+--- /dev/null
++++ b/tools/server/server-persist.h
+@@ -0,0 +1,38 @@
++#pragma once
++
++#include "server-task.h"
++
++#include <memory>
++
++struct server_persist_options {
++    std::string directory;
++    std::string identity;
++    bool        cache_hot      = true;
++    size_t      ram_bytes      = 512ull << 20;
++    uint64_t    max_bytes      = 160ull << 30;
++    uint64_t    target_bytes   = 128ull << 30;
++    uint64_t    min_free_bytes = 16ull << 30;
++};
++
++class server_persistent_cache {
++  public:
++    explicit server_persistent_cache(const server_persist_options & options);
++    ~server_persistent_cache();
++    bool               save(const server_prompt &        prompt,
++                            llama_context *              target,
++                            llama_context *              draft,
++                            llama_seq_id                 seq,
++                            const std::vector<uint8_t> & spec,
++                            size_t                       prefix_tokens = 0);
++    bool               load(server_prompt &        prompt,
++                            const server_tokens &  incoming,
++                            llama_context *        target,
++                            llama_context *        draft,
++                            llama_seq_id           seq,
++                            std::vector<uint8_t> & spec);
++    json               stats() const;
++    static std::string identity(const common_params & params);
++  private:
++    struct impl;
++    std::unique_ptr<impl> p;
++};
