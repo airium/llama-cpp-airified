@@ -1,5 +1,6 @@
-# llama.cpp deployment contracts
+# Airified llama.cpp deployment contracts
 
+- The public repository is `airium/llama-cpp-airified`. Keep project branding and the default sibling `llama-cpp-kv-caches/` directory model/hardware-independent; preserve model-specific profile names, API aliases and explicit host path overrides.
 - Use Conventional Commits for every commit (`type(scope): summary`, with an optional scope). Add an explanatory body when useful. Preserve the configured signing policy, and do not commit or push without explicit user authorization.
 - The engine is the pinned vendor base plus the local patches listed in `upstream.json`. `build.sh` applies them without resetting unrelated edits. Keep the patch manifest, default build directory, draft quantizer, profiles and deployment README aligned.
 - Future implementation, experiments, and qualification are **tensor-parallel only**. Preserve non-TP profiles and archived results as historical evidence, not candidate deployments. Target-only diagnostic controls must also use TP.

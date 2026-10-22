@@ -63,7 +63,7 @@ esac
 
 case "${PERSISTENT_CACHE:-0}" in
   1)
-    KV_CACHE_DIR=${KV_CACHE_DIR:-"${REPO_ROOT}/../llama-cpp-qwen3.8-27b-kv-caches/prefix-v1"}
+    KV_CACHE_DIR=${KV_CACHE_DIR:-"${REPO_ROOT}/../llama-cpp-kv-caches/prefix-v1"}
     KV_CACHE_RAM_MIB=${KV_CACHE_RAM_MIB:-512}
     KV_CACHE_MAX_MIB=${KV_CACHE_MAX_MIB:-163840}
     KV_CACHE_TARGET_MIB=${KV_CACHE_TARGET_MIB:-131072}

@@ -1,8 +1,8 @@
-# llama.cpp optimized for Qwen3.8-27B on dual RTX 2080 Ti 22G
+# Airified llama.cpp
 
-Run Qwen3.8-27B with approximately eight-bit weights and KV cache, full 256K context, vision, and DFlash2 on **two NVLink-connected RTX 2080 Ti 22-GiB cards**.
+Airium's llama.cpp-based local inference runtime, with targeted implementation optimizations, tuned deployment profiles, and automatic GPU/RAM/disk prefix reuse.
 
-This repository combines targeted llama.cpp optimizations, a measured quality/performance profile, and automatic GPU/RAM/disk prefix reuse. The default favors prose and document analysis without reducing target precision or context to fit speculative decoding.
+The current validated profile runs **Qwen3.8-27B** with approximately eight-bit weights and KV cache, full 256K context, vision, and DFlash2 on **two NVLink-connected RTX 2080 Ti 22-GiB cards**. It favors prose and document analysis without reducing target precision or context to fit speculative decoding. The configuration and measurements below describe this reference deployment.
 
 [Performance](#performance) · [Setup](#setup) · [Configuration](#configuration) · [Persistent cache](#automatic-tiered-prefix-cache) · [Validation](#validation)
 
@@ -93,8 +93,8 @@ sudo apt-get install -y build-essential git cmake ninja-build \
   python3 python3-venv pkg-config libssl-dev
 
 git clone --recurse-submodules \
-  https://github.com/airium/llama-cpp-qwen3.8-27b-dual-2080ti-22g.git
-cd llama-cpp-qwen3.8-27b-dual-2080ti-22g
+  https://github.com/airium/llama-cpp-airified.git
+cd llama-cpp-airified
 ```
 
 The submodule is pinned; **do not update it to upstream `main`**. `build.sh` applies the checked-in patch sequence and refuses an unexpected revision or conflicting edits.
@@ -203,13 +203,13 @@ No client session header or manual save/restore call is required. Send the conve
 | Setting | Default |
 | --- | --- |
 | `PERSISTENT_CACHE` | `1`; set `0` to disable the persistent tier |
-| `KV_CACHE_DIR` | Sibling `../llama-cpp-qwen3.8-27b-kv-caches/prefix-v1` |
+| `KV_CACHE_DIR` | Sibling `../llama-cpp-kv-caches/prefix-v1` |
 | `KV_CACHE_RAM_MIB` | `512`, for managed hot data, queued writes, staging and metadata—not total process RSS |
 | `KV_CACHE_MAX_MIB` | `163840`: 160-GiB logical disk upper watermark |
 | `KV_CACHE_TARGET_MIB` | `131072`: 128-GiB eviction target; must not exceed the upper watermark |
 | `KV_CACHE_MIN_FREE_MIB` | `16384`: preserve 16 GiB of filesystem free space |
 
-Use a dedicated cache directory; independent server processes need separate roots. Snapshots share immutable chunks and are committed atomically. Checksums, model/runtime identities and quota-based probation/LRU eviction handle damaged, incompatible and old entries. Cache state contains conversation data and uses private directory/file permissions.
+Use a dedicated cache directory; independent server processes need separate roots. Set `KV_CACHE_DIR` to keep using an existing cache location. Snapshots share immutable chunks and are committed atomically. Checksums, model/runtime identities and quota-based probation/LRU eviction handle damaged, incompatible and old entries. Cache state contains conversation data and uses private directory/file permissions.
 
 Only committed snapshots survive a restart. Edited prefixes or incompatible builds can require prefill again; hybrid GDN reuse needs a valid recurrent boundary. `cache_prompt:false` bypasses persistent lookup and saving for that request.
 
