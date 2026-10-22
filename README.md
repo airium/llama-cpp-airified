@@ -1,5 +1,7 @@
 # Airified llama.cpp
 
+[English](README.md) · [简体中文](README.zh-CN.md)
+
 Airium's llama.cpp-based local inference runtime, with targeted implementation optimizations, tuned deployment profiles, and automatic GPU/RAM/disk prefix reuse.
 
 The current validated profile runs **Qwen3.8-27B** with approximately eight-bit weights and KV cache, full 256K context, vision, and DFlash2 on **two NVLink-connected RTX 2080 Ti 22-GiB cards**. It favors prose and document analysis without reducing target precision or context to fit speculative decoding. The configuration and measurements below describe this reference deployment.

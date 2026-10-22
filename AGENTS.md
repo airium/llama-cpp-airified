@@ -14,6 +14,7 @@
 - Read the workspace instructions and inspect live processes, GPUs, and ports before inference. Use isolated trials and restore any authorized interrupted service. Read vendor instructions before changing upstream source.
 - Keep investigation narratives and benchmark results in the existing runtime archive's `main.md`, with raw evidence alongside it. Do not recreate a separate performance note. Distinguish measured results, source-derived estimates, and unverified hypotheses.
 - Keep the public README focused on the current deployment and its measured performance. Superseded parameter rows and detailed measurement chronology belong in the archive, not repeated user-facing caveats; refresh measurements when needed.
+- Keep `README.md` as the default English guide and `README.zh-CN.md` as its Simplified Chinese counterpart. Synchronize commands, configuration defaults, benchmark results and qualification scope across both versions.
 - Health-ready and configured context do not establish capacity. Changed deployment candidates require actual image and full-context qualification; retain failed exact-token checks as failures. Do not infer CUDA graph replay or KV persistence from configuration alone.
 
 - Automatic persistent prefix reuse is part of the selected deployment. Keep active attention GPU-resident; storage I/O is for safe snapshot/restore boundaries, not per-token SSD attention paging. Preserve target/draft state, recurrent checkpoints and media identity together; attention-only cache hits are insufficient for this hybrid model.
