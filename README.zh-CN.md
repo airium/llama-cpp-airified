@@ -138,6 +138,8 @@ bash build.sh
 
 构建默认值：`CUDA_TOOLKIT=/usr/local/cuda`、`BUILD_DIR=build/sm75-q8-persist`、`BUILD_JOBS=16`。可按需覆盖，如 `BUILD_JOBS=8 bash build.sh`。
 
+默认增量构建；目录移动后会自动刷新失效的 CMake 路径。需要完全重编译时运行 `bash build.sh --rebuild`。移动仓库后还需重建 `.venv`。
+
 ### 4. 选择 GPU 并启动
 
 ```bash

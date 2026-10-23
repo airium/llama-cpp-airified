@@ -138,6 +138,8 @@ For system NCCL, omit the `export` if autodetected, or point `NCCL_ROOT` to a pr
 
 Build defaults: `CUDA_TOOLKIT=/usr/local/cuda`, `BUILD_DIR=build/sm75-q8-persist`, `BUILD_JOBS=16`. Override as needed, e.g. `BUILD_JOBS=8 bash build.sh`.
 
+Builds are incremental; stale CMake paths are refreshed automatically after a move. Use `bash build.sh --rebuild` for a clean rebuild. Recreate `.venv` after moving the checkout.
+
 ### 4. Select your GPUs and launch
 
 ```bash
